@@ -102,15 +102,14 @@ class RainbowDQNAgent:
 
         batch = random.sample(self.memory, self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
-
-        states = np.array(states)
-        states = torch.FloatTensor(states)
+        states = np.stack([np.array(s, dtype=np.float32).squeeze() for s in states])
+        states = torch.from_numpy(states).float()
         actions = np.array(actions)
         actions = torch.LongTensor(actions)
         rewards = np.array(rewards)
         rewards = torch.FloatTensor(rewards)
-        next_states = np.array(next_states)
-        next_states = torch.FloatTensor(next_states)
+        next_states = np.stack([np.array(s, dtype=np.float32).squeeze() for s in next_states])
+        next_states = torch.from_numpy(next_states).float()
         dones = np.array(dones)
         dones = torch.FloatTensor(dones)
 
