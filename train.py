@@ -1,169 +1,161 @@
 import numpy as np
-import gym_super_mario_bros
-from nes_py.wrappers import JoypadSpace
-from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
-from gym.wrappers.gray_scale_observation import GrayScaleObservation
-from gym.wrappers.resize_observation import ResizeObservation
-from gym.wrappers.frame_stack import FrameStack
-from gym.spaces import Discrete
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import gym_super_mario_bros
+from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
+from nes_py.wrappers import JoypadSpace
+from gym.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 from collections import deque
 import random
+from tqdm import tqdm
+
+
+def conv_output_size(shape, model):
+    dummy = torch.zeros(shape)
+    out = model(dummy)
+    return int(torch.prod(torch.tensor(out.shape[1:])))
 
 
 class DuelingQNetwork(nn.Module):
     def __init__(self, input_shape, num_actions):
-        super(DuelingQNetwork, self).__init__()
-
-        self.input_shape = input_shape
-        self.num_actions = num_actions
-
-        # Convolutional layers
+        super().__init__()
+        c, h, w, _ = input_shape  # e.g. (4,84,84,1)
         self.features = nn.Sequential(
-            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            nn.Conv2d(c, 32, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
         )
-
-        # Fully connected layers
-        self.fc = nn.Sequential(nn.Linear(self.feature_size(), 512), nn.ReLU())
-
-        # Value stream
-        self.value_stream = nn.Sequential(nn.Linear(512, 1))
-
-        # Advantage stream
-        self.advantage_stream = nn.Sequential(nn.Linear(512, num_actions))
-
-    def feature_size(self):
-        return self._get_conv_output((1, *self.input_shape))
-
-    def _get_conv_output(self, shape):
-        output_feat = self._forward_features(torch.zeros(shape))
-        n_size = output_feat.data.view(1, -1).size(1)
-        return n_size
-
-    def _forward_features(self, x):
-        x = x.squeeze(-1)  # Remove the last dimension
-        x = self.features(x)
-        return x
+        conv_out = conv_output_size((1, c, h, w), self.features)
+        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(conv_out, 512), nn.ReLU())
+        self.value_stream = nn.Linear(512, 1)
+        self.advantage_stream = nn.Linear(512, num_actions)
 
     def forward(self, x):
-        x = self._forward_features(x)
-        x = x.view(x.size(0), -1)
+        # x: (batch, c, h, w)
+        x = self.features(x)
         x = self.fc(x)
         values = self.value_stream(x)
         advantages = self.advantage_stream(x)
-
-        # Combine value and advantage
-        q_values = values + (advantages - advantages.mean(dim=1, keepdim=True))
-
-        return q_values
+        q = values + (advantages - advantages.mean(dim=1, keepdim=True))
+        return q
 
 
 class RainbowDQNAgent:
-    def __init__(self, state_shape, n_actions, learning_rate=0.0001):
-        self.q_network = DuelingQNetwork(state_shape, n_actions)
-        self.target_network = DuelingQNetwork(state_shape, n_actions)
+    def __init__(
+        self,
+        state_shape,
+        n_actions,
+        lr=1e-4,
+        gamma=0.99,
+        epsilon_start=1.0,
+        epsilon_min=0.01,
+        epsilon_decay=0.999,
+        memory_size=100000,
+        batch_size=32,
+        target_update_freq=10000,
+    ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.q_network = DuelingQNetwork(state_shape, n_actions).to(self.device)
+        self.target_network = DuelingQNetwork(state_shape, n_actions).to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.target_network.eval()
 
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
-        self.memory = deque(maxlen=100000)  # Placeholder for prioritized replay
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.memory = deque(maxlen=memory_size)
 
-        # Hyperparameters
-        self.gamma = 0.99
-        self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.999
-        self.batch_size = 32
-        self.target_update = 10000
+        self.gamma = gamma
+        self.epsilon = epsilon_start
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.batch_size = batch_size
+        self.target_update_freq = target_update_freq
+        self.step_count = 0
 
     def act(self, state):
+        # state: raw numpy array from env, shape (4,84,84,1)
         if random.random() < self.epsilon:
-            return random.randrange(self.q_network.num_actions)
-        else:
-            with torch.no_grad():
-                state = np.array(state)
-                state = torch.FloatTensor(state).squeeze(-1).unsqueeze(0)
-                return self.q_network(state).argmax().item()
+            return random.randrange(self.q_network.advantage_stream.out_features)
+        state = np.array(state, dtype=np.float32).squeeze(-1)
+        state = torch.from_numpy(state).unsqueeze(0).to(self.device)  # (1,4,84,84)
+        with torch.no_grad():
+            q_vals = self.q_network(state)
+        return q_vals.argmax(1).item()
 
     def cache(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
+        # store transitions as numpy arrays
+        self.memory.append(
+            (
+                np.array(state, dtype=np.float32),
+                action,
+                reward,
+                np.array(next_state, dtype=np.float32),
+                done,
+            )
+        )
 
     def learn(self):
         if len(self.memory) < self.batch_size:
             return
-
         batch = random.sample(self.memory, self.batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        states = np.stack([np.array(s, dtype=np.float32).squeeze() for s in states])
-        states = torch.from_numpy(states).float()
-        actions = np.array(actions)
-        actions = torch.LongTensor(actions)
-        rewards = np.array(rewards)
-        rewards = torch.FloatTensor(rewards)
-        next_states = np.stack([np.array(s, dtype=np.float32).squeeze() for s in next_states])
-        next_states = torch.from_numpy(next_states).float()
-        dones = np.array(dones)
-        dones = torch.FloatTensor(dones)
+        states, actions, rewards, next_states, dones = map(np.array, zip(*batch))
 
-        q_values = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        # preprocess
+        states = torch.from_numpy(states).squeeze(-1).to(self.device)  # (B,4,84,84)
+        next_states = torch.from_numpy(next_states).squeeze(-1).to(self.device)
+        actions = torch.from_numpy(actions).long().to(self.device)
+        rewards = torch.from_numpy(rewards).float().to(self.device)
+        dones = torch.from_numpy(dones).float().to(self.device)
 
+        # current Q
+        q_vals = self.q_network(states)
+        q_vals = q_vals.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        # target Q
         with torch.no_grad():
-            next_q_values = self.target_network(next_states).max(1)[0]
-            targets = rewards + self.gamma * next_q_values * (1 - dones)
+            next_q = self.target_network(next_states).max(1)[0]
+            target = rewards + self.gamma * next_q * (1 - dones)
 
-        loss = F.smooth_l1_loss(q_values, targets)
+        loss = F.smooth_l1_loss(q_vals, target)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        # update epsilon
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-        if len(self.memory) % self.target_update == 0:
+        # update target network
+        self.step_count += 1
+        if self.step_count % self.target_update_freq == 0:
             self.target_network.load_state_dict(self.q_network.state_dict())
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # setup env
+    env = gym_super_mario_bros.make("SuperMarioBros-v0")
+    env = JoypadSpace(env, COMPLEX_MOVEMENT)
+    env = GrayScaleObservation(env, keep_dim=True)
+    env = ResizeObservation(env, (84, 84))
+    env = FrameStack(env, 4)
 
-    # Create the environment
-    env = gym_super_mario_bros.make("SuperMarioBros-v3")
-    env = JoypadSpace(env, COMPLEX_MOVEMENT)  # Simplify actions to 7 discrete actions
-    env = GrayScaleObservation(env, keep_dim=True)  # Convert to grayscale
-    env = ResizeObservation(env, (84, 84))  # Resize to 84x84 pixels
-    env = FrameStack(env, 4)  # Stack 4 frames for temporal information
-
-    state_shape = env.observation_space.shape
-
-    if isinstance(env.action_space, Discrete):
-        n_actions = env.action_space.n
-    else:
-        raise (ValueError("Action space is not discrete."))
-    print(f"State shape: {state_shape}, Number of actions: {n_actions}")
+    state_shape = env.observation_space.shape  # (4,84,84,1)
+    n_actions = env.action_space.n
 
     agent = RainbowDQNAgent(state_shape, n_actions)
-    agent.q_network.to(device)
-    agent.target_network.to(device)
+
+    print(f"Device = {agent.device}")
 
     num_episodes = 10000
     max_steps = 10000
-
-    for episode in range(num_episodes):
+    for ep in tqdm(range(num_episodes), desc="Episodes"):
         state = env.reset()
-        state = np.array(state)
-        state = torch.FloatTensor(state).to(device).unsqueeze(0)
         total_reward = 0
-        for step in range(max_steps):
-            action = agent.act(np.array(state))
+        for t in range(max_steps):
+            action = agent.act(state)
             next_state, reward, done, _ = env.step(action)
             agent.cache(state, action, reward, next_state, done)
             agent.learn()
@@ -171,4 +163,6 @@ if __name__ == "__main__":
             total_reward += reward
             if done:
                 break
-        print(f"Episode {episode}, Total Reward: {total_reward}")
+        tqdm.write(
+            f"Episode {ep} - Reward: {total_reward:.2f} - Epsilon: {agent.epsilon:.4f}"
+        )
