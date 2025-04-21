@@ -14,7 +14,6 @@ import random
 import math
 from collections import namedtuple
 from typing import List, Tuple
-from tqdm import tqdm, trange
 import time
 
 # Store experience as named tuples
@@ -25,7 +24,7 @@ Experience = namedtuple(
 
 # Noisy Linear Layer for exploration
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, std_init=0.4):
+    def __init__(self, in_features, out_features, std_init=0.5):
         super(NoisyLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -499,24 +498,21 @@ if __name__ == "__main__":
         target_update=10000,
         batch_size=32,
         buffer_size=100000,
-        v_min=-10,
-        v_max=10,
+        v_min=-30,
+        v_max=100,
         num_atoms=51,
     )
     # Training parameters
-    total_frames = 10_000_000  # 10 million frames total
+    total_frames = 1_000_000  # 1 million frames total
     max_episode_steps = 10000
-    log_interval = 100000  # Print progress every 100k frames
-    save_interval = 1000000  # Save model every 1M frames
+    log_interval = 10000  # Print progress every 10k frames
+    save_interval = 100000  # Save model every 100k frames
 
     # Lists for tracking progress
     episode_rewards = []
     mean_rewards = []
     frame_count = 0
     episode_count = 0
-
-    # Create progress bar for total frames
-    pbar_frames = tqdm(total=total_frames, desc="Training Progress")
 
     try:
         while frame_count < total_frames:
@@ -547,14 +543,6 @@ if __name__ == "__main__":
                 # Give positive reward for moving right and gaining score
                 modified_reward = reward
                 # Add bonus for moving right
-                x_pos_diff = info.get("x_pos", 0) - info.get("x_pos_prev", 0)
-                if x_pos_diff > 0:
-                    modified_reward += 0.1 * x_pos_diff
-                # Penalize for time passing (encourages faster completion)
-                modified_reward -= 0.01
-                # Clip very negative rewards
-                if modified_reward < -10:
-                    modified_reward = -10
 
                 # Store the transition in memory
                 agent.store_transition(state, action, modified_reward, next_state, done)
@@ -567,9 +555,6 @@ if __name__ == "__main__":
                 loss = agent.optimize_model()
                 if loss != 0:
                     losses.append(loss)
-
-                # Update the progress bar
-                pbar_frames.update(1)
 
                 # Log at specific frame intervals
                 if frame_count % log_interval == 0:
@@ -626,7 +611,7 @@ if __name__ == "__main__":
 
     finally:
         # Save final model
-        model_path = f"rainbow_mario_model_final_frame_{frame_count}.pth"
+        model_path = "rainbow_mario_model_final.pth"
         agent.save_model(model_path)
         print(f"Saved final model to {model_path}")
         print(
