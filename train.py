@@ -64,6 +64,7 @@ class NoisyLinear(nn.Module):
         if self.training:
             weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
             bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+            self.reset_noise()
         else:
             weight = self.weight_mu
             bias = self.bias_mu
@@ -344,9 +345,6 @@ class RainbowAgent:
         if len(self.memory) < self.batch_size:
             return 0  # Not enough samples
 
-        # Reset noise for this optimization step
-        self.reset_noise()
-
         # Sample from memory
         states, actions, rewards, next_states, dones, indices, weights = (
             self.memory.sample(self.batch_size)
@@ -522,9 +520,6 @@ if __name__ == "__main__":
             losses = []
             best_x_pos = 0  # Track furthest Mario has gone
             episode_steps = 0
-
-            # Reset noise for this episode
-            agent.reset_noise()
 
             for step in range(max_episode_steps):
                 # Select and perform action
