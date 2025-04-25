@@ -10,7 +10,7 @@ from gym_super_mario_bros.actions import (
 )
 from collections import deque
 
-SKIP_FRAMES = 4
+SKIP_FRAMES = 0
 STACK_FRAMES = 4
 
 
