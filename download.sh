@@ -1,2 +1,2 @@
 #!/bin/bash
-curl -L -o rainbow_mario_model_final.pth "https://www.dropbox.com/scl/fi/ux41bswur8ky0hm29ftjp/rainbow_mario_model_frame_700000.pth?rlkey=8tzayjhb4rihvyn1r8t9dxnl0&st=76tcss24&dl=0"
+curl -L -o rainbow_mario_model_final.pth "https://www.dropbox.com/scl/fi/d1rz9dh4loytpm70ame83/rainbow_mario_model_final.pth?rlkey=y21qljha6wj24t4iozmsvwx1p&st=j06d5arq&dl=0"

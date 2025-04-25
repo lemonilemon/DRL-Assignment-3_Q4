@@ -24,7 +24,7 @@ Experience = namedtuple(
     "Experience", ("state", "action", "reward", "next_state", "done")
 )
 
-LIFE = 3
+LIFE = 1
 
 
 # === SkipFrame Wrapper ===
@@ -543,14 +543,14 @@ class RainbowAgent:
 
 if __name__ == "__main__":
     # === Training Parameters ===
-    total_frames_to_train = 2_000_000
+    total_frames_to_train = 5_000_000
     max_episode_steps = 4500  # Define max steps for TimeLimit wrapper
     log_interval_steps = 10000  # Log based on agent steps (optimize calls)
     save_interval_steps = 100000  # Save based on agent steps
     print_episode_summary = True
     # Reward Shaping Parameters
     death_penalty = -15.0
-    move_reward = 1.0
+    move_reward = 0
 
     # === Environment Setup ===
     env_id = "SuperMarioBros-v0"
@@ -590,7 +590,7 @@ if __name__ == "__main__":
         learning_rate=0.0004,
         gamma=0.9,
         n_step=5,
-        target_update=1000,
+        target_update=10000,
         batch_size=32,
         buffer_size=10000,
         v_min=-50,
@@ -602,7 +602,7 @@ if __name__ == "__main__":
     )
 
     # Load checkpoint if specified
-    load_checkpoint = False
+    load_checkpoint = True
     checkpoint_dir = "mario_rainbow_checkpoints"  # Define checkpoint directory
     checkpoint_path = os.path.join(checkpoint_dir, "rainbow_mario_model_latest.pth")
     if load_checkpoint:
@@ -627,6 +627,7 @@ if __name__ == "__main__":
             max_x_pos = 0
             episode_start_lives = 3 - LIFE  # For 1-life mode check
             prev_x_pos = 0  # Initialize for reward shaping
+            prev_life = 3
 
             # Episode loop
             while True:  # Loop until done (effective_done)
@@ -638,9 +639,9 @@ if __name__ == "__main__":
 
                 # --- 1-Life Modification & Termination Check ---
                 current_lives = info.get("life", episode_start_lives)
-                life_lost = current_lives < episode_start_lives
+                life_lost = current_lives < prev_life
                 # effective_done determines if the episode loop should break
-                effective_done = done or life_lost
+                effective_done = done or (current_lives < episode_start_lives)
                 # --- End 1-Life Modification ---
 
                 # --- Reward Shaping ---
@@ -656,6 +657,7 @@ if __name__ == "__main__":
                     custom_reward += death_penalty
                 # Update previous position
                 prev_x_pos = current_x_pos
+                prev_life = current_lives  # Update previous life count
                 # --- End Reward Shaping ---
 
                 # Track progress
