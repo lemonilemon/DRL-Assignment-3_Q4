@@ -135,7 +135,7 @@ class Agent:
         )
         self.last_action = 0
         self.frames = deque(maxlen=STACK_FRAMES)
-        self.skip_count = 0
+        self.skip_count = SKIP_FRAMES - 1
 
     def _load_model(self, filepath):
         """Loads policy network weights from a checkpoint file."""
@@ -261,5 +261,5 @@ class Agent:
             action = expected_value.argmax(dim=1).item()  # Get the index (action)
         # print(action)
         self.last_action = action
-        self.skip_count = SKIP_FRAMES
+        self.skip_count = SKIP_FRAMES - 1
         return action
