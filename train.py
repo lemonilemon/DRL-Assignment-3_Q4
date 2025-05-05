@@ -1,46 +1,50 @@
 # -*- coding: utf-8 -*-
 """
-Improved Rainbow DQN Agent for Super Mario Bros. with ICM.
+Improved Rainbow DQN Agent for Super Mario Bros. with ICM (C51 Removed).
 
 Combines:
 - Dueling DQN
 - Noisy Nets for exploration
 - Prioritized Experience Replay (PER)
 - N-step Bootstrapping
-- Distributional RL (C51)
 - Intrinsic Curiosity Module (ICM) for exploration bonus
+    - Features detached before ICM encoder to prevent ICM loss backprop to extractor.
+    - Lowered icm_eta to 0.01.
+    - Added gradient clipping for ICM optimizer.
 - Reward Shaping Wrapper (Refined reset logic)
 - Frame Normalization Wrapper (to float32 [0,1])
 - Centralized Hyperparameters
-- Observation resized to (84, 84)
+- Observation resized to (84, 90)
 - Logs extrinsic (shaped/unshaped) and intrinsic rewards
 - Fixed device mismatch error during network initialization.
 - Integrated ICM using a shared feature extractor.
 - Fixed state shape issue caused by GrayScaleObservation keep_dim.
+- Removed Distributional RL (C51) components. Uses Smooth L1 Loss.
 """
 
-import numpy as np
+import datetime  # Added for elapsed time formatting
+import math
+import os
+import random
+import time
+from collections import deque, namedtuple
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+
 import gym
 import gym_super_mario_bros
-from nes_py.wrappers import JoypadSpace
-from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
-from gym.wrappers.gray_scale_observation import GrayScaleObservation
-from gym.wrappers.resize_observation import ResizeObservation
-from gym.wrappers.frame_stack import FrameStack
-from gym.wrappers import TimeLimit
-from gym.spaces import Box
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import random
-import math
-from collections import namedtuple, deque
-from typing import List, Tuple, Optional, Any, Deque, Dict, Union
-import time
-import os
-from dataclasses import dataclass, field
-import datetime # Added for elapsed time formatting
+from gym.spaces import Box
+from gym.wrappers import TimeLimit
+from gym.wrappers.frame_stack import FrameStack
+from gym.wrappers.gray_scale_observation import GrayScaleObservation
+from gym.wrappers.resize_observation import ResizeObservation
+from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
+from nes_py.wrappers import JoypadSpace
 
 # Optional: For TensorBoard logging
 # from torch.utils.tensorboard import SummaryWriter
@@ -52,19 +56,19 @@ class Hyperparameters:
     """Centralized hyperparameters for training."""
 
     # --- Environment ---
-    env_id: str = "SuperMarioBros-v0"
+    env_id: str = "SuperMarioBros-1-2-v0"
     life_mode: int = 3 # Life mode (1 means terminate episode on first life lost)
     starting_lives: int = 3 # Default starting lives in Super Mario Bros
     skip_frames: int = 4
     stack_frames: int = 4
-    resize_dim: Union[int, Tuple[int, int]] = (84) # Resize dimension (Height, Width)
+    resize_dim: Union[int, Tuple[int, int]] = (84, 90) # Resize dimension (Height, Width)
     max_episode_steps: int = 4500 # Max steps per episode (via TimeLimit wrapper)
 
     # --- Reward Shaping ---
-    death_penalty: float = 0
-    move_reward: float = 0 # Small reward for moving right
-    stuck_penalty: float = 0 # Penalty for staying in the same x-pos
-    step_penalty: float = 0 # Small penalty per step to encourage progress
+    death_penalty: float = -100
+    move_reward: float = 0.1 # Small reward for moving right
+    stuck_penalty: float = -0.1 # Penalty for staying in the same x-pos
+    step_penalty: float = -0.01 # Small penalty per step to encourage progress
 
     # --- Training ---
     total_train_steps: int = 5_000_000
@@ -72,24 +76,24 @@ class Hyperparameters:
     learning_rate: float = 0.0001 # Adam learning rate for DQN
     adam_eps: float = 1.5e-4 # Adam epsilon for DQN
 
-    gamma: float = 0.8 # Discount factor for Bellman equation (extrinsic)
+    gamma: float = 0.9 # Discount factor for Bellman equation (extrinsic)
     target_update_freq: int = 10000 # Steps between target network updates
     gradient_clip_norm: float = 10.0 # Clip gradients to this norm
 
     # --- Replay Buffer (PER) ---
     buffer_size: int = 10000
-    per_alpha: float = 0.5 # Priority exponent
+    per_alpha: float = 0.6 # Priority exponent
     per_beta_start: float = 0.4 # Initial importance sampling exponent
-    per_beta_frames: int = 1_000_000 # Steps to anneal beta to 1.0
+    per_beta_frames: int = 2_000_000 # Steps to anneal beta to 1.0
     per_epsilon: float = 1e-5 # Small value added to priorities
 
     # --- N-Step Returns ---
     n_step: int = 5 # Number of steps for N-step returns
 
-    # --- Distributional RL (C51) ---
-    num_atoms: int = 51 # Number of atoms in value distribution
-    v_min: float = -50.0 # Minimum value for distribution support (adjust if needed for ICM)
-    v_max: float = 150.0 # Maximum value for distribution support (adjust if needed for ICM)
+    # --- Distributional RL (C51) --- REMOVED ---
+    # num_atoms: int = 51 # REMOVED
+    # v_min: float = -100.0 # REMOVED
+    # v_max: float = 150.0 # REMOVED
 
     # --- Noisy Nets ---
     noisy_std_init: float = 2.5 # Initial standard deviation for NoisyLinear layers
@@ -97,8 +101,8 @@ class Hyperparameters:
     # --- ICM ---
     use_icm: bool = True # Flag to enable/disable ICM
     icm_embed_dim: int = 256 # Dimensionality of ICM state encoding
-    icm_beta: float = 0.2 # Weight for the forward model loss in ICM
-    icm_eta: float = 0.1 # Scaling factor for intrinsic reward
+    icm_beta: float = 0.1 # Weight for the forward model loss in ICM
+    icm_eta: float = 0.01 # MODIFIED: Scaling factor for intrinsic reward (lowered)
     icm_lr: float = 0.0001 # Learning rate for ICM optimizer
     icm_adam_eps: float = 1.5e-4 # Adam epsilon for ICM
 
@@ -106,21 +110,21 @@ class Hyperparameters:
     log_interval_steps: int = 10000 # Log progress every N agent steps
     save_interval_steps: int = 100000 # Save checkpoint every N agent steps
     print_episode_summary: bool = True
-    checkpoint_dir: str = "mario_rainbow_icm_checkpoints_v1" # Updated dir name
+    checkpoint_dir: str = "mario_rainbow_icm_checkpoints_v1-1_no_c51_detached" # Updated dir name
     load_checkpoint: bool = True # Set to True to load latest checkpoint if exists
     # Optional: Path for TensorBoard logs
-    # tensorboard_log_dir: str = "logs/mario_rainbow_icm_v1"
+    # tensorboard_log_dir: str = "logs/mario_rainbow_icm_v1_no_c51_detached"
 
     # --- Derived / Calculated ---
     n_step_gamma: float = field(init=False) # Calculated discount factor for n-step returns
-    delta_z: float = field(init=False) # Calculated delta_z for distributional RL
+    # delta_z: float = field(init=False) # REMOVED
     device: torch.device = field(init=False) # Device for PyTorch
     processed_resize_dim: Tuple[int, int] = field(init=False) # Process resize_dim
 
     def __post_init__(self):
         """Calculate derived parameters after initialization."""
         self.n_step_gamma = self.gamma**self.n_step
-        self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
+        # self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1) # REMOVED
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # Ensure resize_dim is a tuple (H, W) for ResizeObservation wrapper
         if isinstance(self.resize_dim, int):
@@ -412,7 +416,7 @@ class NoisyLinear(nn.Module):
 
 
 class RainbowDQN(nn.Module):
-    """Dueling Network with Noisy Layers and Distributional RL (C51)."""
+    """Dueling Network with Noisy Layers (No C51)."""
     def __init__(
         self,
         input_shape: Tuple[int, int, int], # Expected (C, H, W) e.g., (4, 84, 84)
@@ -426,9 +430,9 @@ class RainbowDQN(nn.Module):
             raise ValueError(f"Expected input_shape (C, H, W), got {input_shape}")
         self.input_shape = input_shape
         self.num_actions = num_actions
-        self.num_atoms = params.num_atoms
-        self.v_min = params.v_min
-        self.v_max = params.v_max
+        # self.num_atoms = params.num_atoms # REMOVED
+        # self.v_min = params.v_min # REMOVED
+        # self.v_max = params.v_max # REMOVED
         self.device = params.device # Store device from params
 
         # Use the provided shared feature extractor
@@ -440,27 +444,27 @@ class RainbowDQN(nn.Module):
         self.advantage_stream = nn.Sequential(
             NoisyLinear(feature_size, 512, std_init=params.noisy_std_init),
             nn.ReLU(),
-            # Output: num_actions * num_atoms for the advantage distribution
-            NoisyLinear(512, num_actions * self.num_atoms, std_init=params.noisy_std_init),
+            # Output: num_actions for the advantage values
+            NoisyLinear(512, num_actions, std_init=params.noisy_std_init), # MODIFIED
         )
         self.value_stream = nn.Sequential(
             NoisyLinear(feature_size, 512, std_init=params.noisy_std_init),
             nn.ReLU(),
-            # Output: num_atoms for the value distribution
-            NoisyLinear(512, self.num_atoms, std_init=params.noisy_std_init),
+            # Output: 1 for the state value
+            NoisyLinear(512, 1, std_init=params.noisy_std_init), # MODIFIED
         )
 
-        # Support atoms for distributional RL (initialized on CPU, moved later)
-        self.register_buffer(
-            "support", torch.linspace(self.v_min, self.v_max, self.num_atoms)
-        )
+        # Support atoms for distributional RL (initialized on CPU, moved later) - REMOVED
+        # self.register_buffer(
+        #     "support", torch.linspace(self.v_min, self.v_max, self.num_atoms)
+        # )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns the probability distribution over atoms for each action.
+        """Returns the Q-values for each action.
         Args:
             x: Input tensor (Batch, C, H, W), normalized float32 [0, 1].
         Returns:
-            q_probs: Tensor (Batch, Num_Actions, Num_Atoms) representing action-value distributions.
+            q_values: Tensor (Batch, Num_Actions) representing action-values.
         """
         batch_size = x.size(0)
         # 1. Extract features using the shared CNN
@@ -470,37 +474,31 @@ class RainbowDQN(nn.Module):
         x = x.view(batch_size, -1)
 
         # 3. Pass flattened features through value and advantage streams
-        # Reshape outputs to (batch_size, 1, num_atoms) for value
-        # and (batch_size, num_actions, num_atoms) for advantage
-        value_dist = self.value_stream(x).view(batch_size, 1, self.num_atoms)
-        advantage_dist = self.advantage_stream(x).view(
-            batch_size, self.num_actions, self.num_atoms
-        )
+        value = self.value_stream(x) # Shape (batch_size, 1)
+        advantage = self.advantage_stream(x) # Shape (batch_size, num_actions)
 
         # 4. Combine streams using dueling architecture formula:
         # Q(s,a) = V(s) + (A(s,a) - mean(A(s,a')))
-        # This is applied to the distributions (logits before softmax)
-        q_dist = value_dist + (advantage_dist - advantage_dist.mean(dim=1, keepdim=True))
+        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
 
-        # 5. Apply softmax along the atom dimension (-1) to get probabilities
-        q_probs = F.softmax(q_dist, dim=-1)
-        return q_probs
-
-    def get_q_values(self, x: torch.Tensor) -> torch.Tensor:
-        """Calculates the expected Q-values from the action-value distributions.
-        Args:
-            x: Input tensor (Batch, C, H, W), normalized float32 [0, 1].
-        Returns:
-            q_values: Tensor (Batch, Num_Actions) of expected Q-values.
-        """
-        # Get the action-value distributions (probabilities)
-        q_probs = self.forward(x)
-        # Ensure support atoms are on the same device as probabilities
-        support = self.support.to(q_probs.device)
-        # Calculate expected value: Q(s,a) = sum_i (probability(z_i) * z_i)
-        # Reshape support for broadcasting: (1, 1, num_atoms)
-        q_values = (q_probs * support.view(1, 1, self.num_atoms)).sum(dim=2)
+        # 5. No softmax needed as we output Q-values directly
         return q_values
+
+    # def get_q_values(self, x: torch.Tensor) -> torch.Tensor: # REMOVED - forward now returns Q-values
+    #     """Calculates the expected Q-values from the action-value distributions.
+    #     Args:
+    #         x: Input tensor (Batch, C, H, W), normalized float32 [0, 1].
+    #     Returns:
+    #         q_values: Tensor (Batch, Num_Actions) of expected Q-values.
+    #     """
+    #     # Get the action-value distributions (probabilities)
+    #     q_probs = self.forward(x)
+    #     # Ensure support atoms are on the same device as probabilities
+    #     support = self.support.to(q_probs.device)
+    #     # Calculate expected value: Q(s,a) = sum_i (probability(z_i) * z_i)
+    #     # Reshape support for broadcasting: (1, 1, num_atoms)
+    #     q_values = (q_probs * support.view(1, 1, self.num_atoms)).sum(dim=2)
+    #     return q_values
 
     def reset_noise(self):
         """Resets noise in all NoisyLinear layers within the network."""
@@ -578,20 +576,22 @@ class ICM(nn.Module):
             phi_next: Actual next state embedding (detached). Shape (B, embed_dim).
         """
         # 1. Extract features using the shared CNN
-        # Gradients *will* flow back from ICM loss to the feature extractor
-        feat = self.feature_extractor(state)
-        next_feat = self.feature_extractor(next_state)
+        # --- MODIFICATION: Detach features here to prevent ICM loss backprop to extractor ---
+        feat = self.feature_extractor(state).detach()
+        next_feat = self.feature_extractor(next_state).detach()
 
         # 2. Flatten features
         feat = feat.view(feat.size(0), -1) # Shape (B, feature_size)
         next_feat = next_feat.view(next_feat.size(0), -1) # Shape (B, feature_size)
 
         # 3. Encode features into embedding space
+        # Input to encoder is now detached from the feature extractor's computation graph
         phi = self.encoder(feat) # Shape (B, embed_dim)
         phi_next = self.encoder(next_feat) # Shape (B, embed_dim)
 
         # --- 4. Inverse Model Calculation ---
         # Concatenate current and next state embeddings
+        # Note: phi and phi_next still carry gradients wrt the encoder parameters
         inv_input = torch.cat([phi, phi_next], dim=1) # Shape (B, embed_dim * 2)
         # Predict action logits
         action_logits = self.inverse_model(inv_input) # Shape (B, num_actions)
@@ -773,7 +773,7 @@ class PrioritizedReplayBuffer:
 # === Rainbow Agent with ICM ===
 
 class RainbowAgent:
-    """Reinforcement Learning Agent combining Rainbow DQN features and ICM.
+    """Reinforcement Learning Agent combining Rainbow DQN features (No C51) and ICM.
     Manages networks, optimizers, replay buffer, and the learning process.
     """
 
@@ -797,7 +797,7 @@ class RainbowAgent:
         self.shared_feature_extractor = FeatureExtractor(state_shape[0]).to(self.device)
 
         # --- Initialize DQN Networks (using shared features) ---
-        print(f"Initializing RainbowDQN with state_shape: {state_shape}")
+        print(f"Initializing RainbowDQN (No C51) with state_shape: {state_shape}")
         # Policy network (learns and selects actions)
         self.policy_net = RainbowDQN(state_shape, n_actions, params, self.shared_feature_extractor).to(self.device)
         # Target network (provides stable targets for learning)
@@ -835,10 +835,10 @@ class RainbowAgent:
         # Temporary buffer to accumulate transitions for N-step return calculation
         self.n_step_accumulator = deque(maxlen=params.n_step)
 
-        # --- Distributional RL Support ---
+        # --- Distributional RL Support --- REMOVED ---
         # Ensure the support tensor (atoms) is on the correct device
-        self.policy_net.support = self.policy_net.support.to(self.device)
-        self.target_net.support = self.target_net.support.to(self.device)
+        # self.policy_net.support = self.policy_net.support.to(self.device)
+        # self.target_net.support = self.target_net.support.to(self.device)
 
         # Optional: TensorBoard Writer for logging
         # self.writer = SummaryWriter(log_dir=params.tensorboard_log_dir)
@@ -873,7 +873,8 @@ class RainbowAgent:
 
             # Get expected Q-values from the policy network
             # NoisyLinear layers automatically use mean weights in eval mode
-            q_values = self.policy_net.get_q_values(state_tensor)
+            # Use forward() directly as it now returns Q-values
+            q_values = self.policy_net(state_tensor) # MODIFIED
 
             # Select action with the highest Q-value (argmax)
             action = q_values.argmax(1).item()
@@ -929,7 +930,7 @@ class RainbowAgent:
 
         # --- Push the N-step experience to PER buffer ---
         # We push: (state at time t, action at time t, N-step reward starting from t+1,
-        #          state at time t+N (or terminal state if earlier), done flag for N-step)
+        #           state at time t+N (or terminal state if earlier), done flag for N-step)
         self.memory.push(
             start_exp.state, start_exp.action, n_step_reward, final_next_state, n_step_done
         )
@@ -940,10 +941,10 @@ class RainbowAgent:
         1. Samples a batch from PER.
         2. Calculates ICM loss and intrinsic reward (if ICM enabled).
         3. Optimizes ICM network.
-        4. Calculates DQN target distribution using combined reward.
-        5. Calculates DQN loss.
+        4. Calculates DQN target Q-value using combined reward and Double DQN.
+        5. Calculates DQN loss (Smooth L1).
         6. Optimizes DQN network (including shared feature extractor).
-        7. Updates priorities in PER buffer.
+        7. Updates priorities in PER buffer based on TD error.
         Returns:
             Tuple[float, float, float]: (DQN loss, ICM loss, Avg Intrinsic Reward in batch)
         """
@@ -975,6 +976,7 @@ class RainbowAgent:
             # Set ICM to training mode
             self.icm.train()
             # Calculate ICM losses (inv_loss, fwd_loss) and embeddings (pred_phi_next, phi_next)
+            # Features passed to ICM are detached inside ICM.forward() now
             inv_loss, fwd_loss, pred_phi_next, phi_next = self.icm(
                 states, next_states, actions
             )
@@ -985,19 +987,19 @@ class RainbowAgent:
 
             # Calculate intrinsic reward based on forward model prediction error
             intrinsic_reward = self.icm.intrinsic_reward(
-                pred_phi_next, phi_next, self.params.icm_eta
+                pred_phi_next, phi_next, self.params.icm_eta # Uses lowered eta
             )
             intrinsic_reward_val = intrinsic_reward.mean().item() # Log average intrinsic reward
 
             # --- 3. Optimize ICM Network ---
             self.icm_optimizer.zero_grad() # Zero gradients for ICM optimizer
-            # Calculate gradients for ICM loss (flows through ICM models and shared CNN)
+            # Calculate gradients for ICM loss (flows through ICM models ONLY, not feature extractor)
             icm_total_loss.backward()
-            # Optional: Clip gradients for ICM parameters if needed
-            # torch.nn.utils.clip_grad_norm_(self.icm.parameters(), self.params.gradient_clip_norm)
+            # MODIFICATION: Clip gradients for ICM parameters
+            torch.nn.utils.clip_grad_norm_(self.icm.parameters(), self.params.gradient_clip_norm)
             self.icm_optimizer.step() # Update ICM parameters
 
-        # --- 4. DQN Computations: Target Distribution ---
+        # --- 4. DQN Computations: Target Q-Value ---
         # Set policy/target nets to appropriate modes
         self.policy_net.train() # Policy net needs noise enabled
         self.target_net.eval() # Target net uses mean weights
@@ -1008,68 +1010,35 @@ class RainbowAgent:
 
         with torch.no_grad(): # Target calculations don't require gradients
             # --- Double DQN: Select best actions for next states using POLICY network ---
-            next_q_values_policy = self.policy_net.get_q_values(next_states) # Shape (B, num_actions)
+            next_q_values_policy = self.policy_net(next_states) # Shape (B, num_actions) # MODIFIED
             next_actions = next_q_values_policy.argmax(1) # Shape (B,)
 
-            # --- Get next state distributions from TARGET network ---
-            next_q_dist_target = self.target_net(next_states) # Shape (B, num_actions, num_atoms)
+            # --- Get next state Q-values from TARGET network ---
+            next_q_values_target = self.target_net(next_states) # Shape (B, num_actions) # MODIFIED
 
-            # Select the distribution corresponding to the best action chosen by policy net
+            # --- Select the Q-value corresponding to the best action chosen by policy net ---
             # Gather along action dimension (dim=1)
-            next_best_q_dist = next_q_dist_target.gather(
-                1, next_actions.view(-1, 1, 1).expand(-1, -1, self.params.num_atoms)
-            ).squeeze(1) # Shape: (batch_size, num_atoms)
+            next_q_target_selected = next_q_values_target.gather(
+                1, next_actions.unsqueeze(1) # Add dimension for gather
+            ).squeeze(1) # Remove added dimension -> Shape: (B,)
 
-            # --- Project the target distribution (Categorical/C51 algorithm) ---
-            support = self.policy_net.support # Get support atoms (z_i) Shape (num_atoms,)
-            # Calculate projected atom locations: Tz = R_n + gamma^n * z
-            # Unsqueeze rewards and dones for broadcasting with support
-            Tz = total_reward.unsqueeze(1) + (
-                1 - n_step_dones.unsqueeze(1) # Use N-step dones here
-            ) * self.params.n_step_gamma * support.unsqueeze(0) # Shape (B, num_atoms)
-
-            # Clamp projected atoms to the predefined support range [V_min, V_max]
-            Tz = Tz.clamp(self.params.v_min, self.params.v_max)
-
-            # Calculate indices (l, u) and weights for projection onto the original support
-            b = (Tz - self.params.v_min) / self.params.delta_z # Normalize Tz to indices
-            l = b.floor().long() # Lower bound index
-            u = b.ceil().long() # Upper bound index
-
-            # Distribute probability mass (from next_best_q_dist) to l and u bins
-            # mass_l = p(a*, z_j) * (u - b)
-            # mass_u = p(a*, z_j) * (b - l)
-            mass_l = next_best_q_dist * (u.float() - b)
-            mass_u = next_best_q_dist * (b - l.float())
-
-            # Initialize target distribution tensor with zeros
-            target_dist = torch.zeros_like(next_best_q_dist) # Shape (B, num_atoms)
-
-            # Scatter-add the probability masses to the corresponding indices (l, u)
-            # Need to ensure l and u are valid indices [0, num_atoms - 1] after floor/ceil
-            l = l.clamp(0, self.params.num_atoms - 1)
-            u = u.clamp(0, self.params.num_atoms - 1)
-            target_dist.scatter_add_(1, l, mass_l)
-            target_dist.scatter_add_(1, u, mass_u)
-            # Target_dist now holds the projected target distribution for each state in the batch
+            # --- Calculate the target Q-value: TD Target ---
+            # target_Q = R_n + gamma^n * Q_target(s_{t+N}, argmax_a Q_policy(s_{t+N}, a))
+            # Use N-step dones here (0.0 if not done, 1.0 if done within N steps)
+            target_Q = total_reward + (1.0 - n_step_dones) * self.params.n_step_gamma * next_q_target_selected
+            # target_Q shape: (B,)
 
         # --- 5. Compute DQN Loss ---
-        # Get current state action distributions from POLICY network
-        current_q_dist_policy = self.policy_net(states) # Shape (B, num_actions, num_atoms)
+        # Get current Q-values from POLICY network for the actions actually taken
+        current_q_values_policy = self.policy_net(states) # Shape (B, num_actions)
+        current_Q = current_q_values_policy.gather(
+            1, actions.unsqueeze(1) # Add dimension for gather
+        ).squeeze(1) # Remove added dimension -> Shape: (B,)
 
-        # Gather the distributions for the actions actually taken in the batch
-        action_indices = (
-            actions.unsqueeze(1).unsqueeze(2).expand(-1, -1, self.params.num_atoms)
-        ) # Shape: (B, 1, num_atoms)
-        current_dist = current_q_dist_policy.gather(1, action_indices).squeeze(1) # Shape: (B, num_atoms)
-
-        # Avoid log(0) errors by clamping probabilities to a small positive value
-        current_dist = current_dist.clamp(min=1e-8)
-        log_p = torch.log(current_dist) # Log probabilities of current distribution
-
-        # Calculate element-wise loss: Cross-entropy between target and current distributions
-        # L = - sum_j (target_dist_j * log(current_dist_j))
-        elementwise_loss = -(target_dist * log_p).sum(1) # Shape (B,) - These are TD errors for PER
+        # Calculate element-wise loss: Smooth L1 Loss (Huber Loss)
+        # L = smooth_l1(current_Q, target_Q)
+        # Target should be detached as we don't want gradients flowing back through it
+        elementwise_loss = F.smooth_l1_loss(current_Q, target_Q.detach(), reduction='none') # Shape (B,)
 
         # --- 6. Optimize DQN Network ---
         # Apply importance sampling weights (from PER) and calculate mean loss
@@ -1087,7 +1056,7 @@ class RainbowAgent:
 
         # --- 7. Update Priorities in PER Buffer ---
         # Use the detached element-wise losses (TD errors) to update priorities
-        new_priorities = elementwise_loss.detach().cpu().numpy()
+        new_priorities = elementwise_loss.detach().cpu().numpy() # Use elementwise loss before weighting
         self.memory.update_priorities(indices, new_priorities)
 
         # --- Agent Step Counter & Target Network Update ---
@@ -1193,7 +1162,7 @@ class RainbowAgent:
             self.reset_noise()
             return True
         except KeyError as e:
-            print(f"Error loading checkpoint: Missing key {e}. Checkpoint might be incompatible or missing required data (e.g., ICM).")
+            print(f"Error loading checkpoint: Missing key {e}. Checkpoint might be incompatible (e.g., from C51 version) or missing required data.")
             return False
         except Exception as e:
             print(f"Error loading model: {e}")
@@ -1244,17 +1213,17 @@ if __name__ == "__main__":
     params = Hyperparameters()
 
     # --- Print Configuration ---
-    print("--- Hyperparameters ---")
+    print("--- Hyperparameters (C51 Removed, Detached ICM Features) ---") # Updated title
     param_dict = vars(params)
     # Exclude derived parameters from the main printout
-    derived_keys = ["n_step_gamma", "delta_z", "device", "processed_resize_dim"]
+    derived_keys = ["n_step_gamma", "device", "processed_resize_dim"] # Removed delta_z
     for key, value in param_dict.items():
         if key not in derived_keys:
             print(f"{key}: {value}")
     # Print derived parameters separately
     print(f"processed_resize_dim: {params.processed_resize_dim}")
     print(f"device: {params.device}")
-    print("---------------------")
+    print("---------------------------------------------------------") # Updated separator
 
     # --- Environment Setup ---
     env = make_env(params)
@@ -1383,7 +1352,7 @@ if __name__ == "__main__":
                         print(f"Avg Shaped Reward (Last 100 ep): {avg_reward_shaped_100:.2f}")
                         print(f"Avg Unshaped Reward (Last 100 ep): {avg_reward_unshaped_100:.2f}")
                         if params.use_icm:
-                           print(f"Avg Intrinsic Reward (Last 100 ep): {avg_reward_intrinsic_100:.4f}")
+                            print(f"Avg Intrinsic Reward (Last 100 ep): {avg_reward_intrinsic_100:.4f}")
                         print(f"Last DQN Loss: {dqn_loss:.4f}" if dqn_loss > 0 else "N/A")
                         if params.use_icm:
                             print(f"Last ICM Loss: {icm_loss:.4f}" if icm_loss > 0 else "N/A")
