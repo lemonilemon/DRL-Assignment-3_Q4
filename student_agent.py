@@ -1,265 +1,263 @@
-import numpy as np
+import gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import PIL
-from torchvision import transforms as T
-import os
-from gym_super_mario_bros.actions import (
-    COMPLEX_MOVEMENT,
-)
+import numpy as np
 from collections import deque
+from torchvision import transforms as T
+from typing import Tuple, Deque, Optional
 
-SKIP_FRAMES = 0
-STACK_FRAMES = 4
-
-
-def pil_to_tensor_no_scale(pil_img):
-    """
-    Converts a PIL Image to a PyTorch tensor (CxHxW) with dtype float32,
-    keeping the original [0, 255] value range.
-    """
-    # Convert PIL image to NumPy array (HxWxC or HxW)
-    img_np = np.array(pil_img)  # dtype will be uint8
-
-    # Ensure it has a channel dimension if grayscale (needed for permute)
-    if img_np.ndim == 2:
-        img_np = np.expand_dims(img_np, axis=2)  # Shape: (H, W, 1)
-
-    # Convert NumPy array to PyTorch Tensor (shares memory)
-    # Shape: (H, W, C), dtype: torch.uint8
-    img_tensor = torch.from_numpy(img_np)
-
-    # Permute dimensions to CxHxW
-    # Shape: (C, H, W), dtype: torch.uint8
-    img_tensor = img_tensor.permute(2, 0, 1)
-
-    # Convert to float tensor *without* scaling
-    # Shape: (C, H, W), dtype: torch.float32
-    img_tensor_float = img_tensor.float()
-    # or img_tensor_float = img_tensor.to(torch.float32)
-
-    return img_tensor_float
+# Assuming these are defined in 'train.py' or accessible elsewhere
+from train import RainbowDQN, NoisyLinear, COMPLEX_MOVEMENT
 
 
-# --- Import necessary components directly from your training script ---
-# Assuming your training script is named 'train.py' and in the same directory
-# or accessible via Python's path.
-try:
-    # We only need the network definitions for the agent class itself
-    from train import NoisyLinear, RainbowDQN
-
-    print("Successfully imported NoisyLinear, RainbowDQN, and SkipFrame from train.py")
-except ImportError as e:
-    print(f"Warning: Error importing from train.py: {e}")
-    print(
-        "Attempting to proceed, but ensure 'train.py' is accessible and defines "
-        "NoisyLinear, RainbowDQN."
-    )
-    # Define dummy classes if import fails, mainly for the example to potentially run
-    # You MUST have the correct classes imported for the agent to function correctly.
-    if "NoisyLinear" not in globals():
-
-        class NoisyLinear(nn.Module):
-            pass  # Placeholder
-
-    if "RainbowDQN" not in globals():
-
-        class RainbowDQN(nn.Module):
-            pass  # Placeholder
-
-
-# --- Agent Class Definition ---
 class Agent:
     """
-    Agent that loads a trained Rainbow DQN model and selects actions.
-    Designed to be used with an evaluation script expecting an 'act' method.
-    Assumes environment preprocessing (wrappers) is handled externally.
+    Agent that interacts with the environment using a pre-trained Rainbow DQN model.
+
+    Handles frame preprocessing, frame stacking, action selection based on the model,
+    and frame skipping.
     """
 
     def __init__(
         self,
-        v_min=-50,
-        v_max=150,
-        num_atoms=51,
+        checkpoint_path: str = "rainbow_mario_model_final.pth",
+        input_shape: Tuple[int, int, int] = (4, 84, 90),  # (Channels, Height, Width)
+        n_actions: int = len(COMPLEX_MOVEMENT),
+        skip_frames: int = 4,
+        device: Optional[str] = None,
     ):
         """
-        Initializes the agent.
+        Initializes the Agent.
 
         Args:
-            v_min (float): Minimum value of the distributional RL support. MUST match training.
-            v_max (float): Maximum value of the distributional RL support. MUST match training.
-            num_atoms (int): Number of atoms in the distributional RL support. MUST match training.
+            checkpoint_path: Path to the saved model checkpoint.
+            input_shape: The shape of the stacked input frames (C, H, W).
+            n_actions: The number of possible actions.
+            skip_frames: The number of frames to repeat the last action for.
+            device: The device to run the model on ('cuda', 'cpu', or None for auto-detect).
         """
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Agent using device: {self.device}")
+        self.n_actions = n_actions
+        self.skip_frames = max(1, skip_frames)  # Ensure at least 1 frame is processed
+        self._frames_to_skip = self.skip_frames - 1  # Internal counter logic
 
-        # Store config needed for action selection and validation
-        self.state_shape = (4, 84, 84)
-        self.n_actions = len(COMPLEX_MOVEMENT)  # Number of actions
-        self.num_atoms = num_atoms
-        self.v_min = v_min
-        self.v_max = v_max
+        # Determine device
+        if device:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
 
-        # --- Network Initialization ---
-        # Use the imported RainbowDQN definition
-        # Ensure the class was actually imported or defined
-        if not issubclass(RainbowDQN, nn.Module) or RainbowDQN is nn.Module:
-            raise RuntimeError(
-                "RainbowDQN class definition not found or invalid. "
-                "Ensure train.py is accessible and defines it correctly."
-            )
-
-        self.policy_net = RainbowDQN(
-            self.state_shape, self.n_actions, num_atoms, v_min, v_max
+        # Initialize the model
+        # Note: Ensure RainbowDQN and NoisyLinear are correctly defined/imported
+        self.model = RainbowDQN(
+            input_shape=input_shape,
+            n_actions=self.n_actions,
+            noisy_sigma_init=0.5,  # Example value, adjust if needed
         ).to(self.device)
 
-        # --- Load Model Weights ---
-        if not self._load_model("rainbow_mario_model_final.pth"):
-            raise RuntimeError(
-                "Failed to load model from rainbow_mario_model_final.pth"
-            )
+        # Load the checkpoint
+        try:
+            # Load checkpoint, supporting both full state dict and nested dicts
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            # Check if the checkpoint is a dict containing the model state_dict
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                model_state = checkpoint["model_state_dict"]
+            elif (
+                isinstance(checkpoint, dict) and "model" in checkpoint
+            ):  # Support original format
+                model_state = checkpoint["model"]
+            else:
+                model_state = checkpoint  # Assume checkpoint is the state_dict itself
 
-        # --- Set to Evaluation Mode ---
-        # CRITICAL: Disables dropout, batch norm updates, and makes NoisyLinear
-        # layers use their mean weights for deterministic actions during inference.
-        self.policy_net.eval()
-        print("Agent initialized and model set to evaluation mode.")
+            self.model.load_state_dict(model_state)
+            print(f"Successfully loaded model from {checkpoint_path}")
+        except FileNotFoundError:
+            print(f"Error: Checkpoint file not found at {checkpoint_path}.")
+            print("Using randomly initialized model instead.")
+        except Exception as e:
+            print(f"Error loading checkpoint from {checkpoint_path}: {e}")
+            print("Using randomly initialized model instead.")
+
+        self.model.eval()  # Set model to evaluation mode (important!)
+
+        # Preprocessing transform: Grayscale -> Resize -> ToTensor
         self.transform = T.Compose(
             [
-                T.ToPILImage(),
-                T.Grayscale(num_output_channels=1),
-                T.Resize((84, 84)),
-                T.Lambda(pil_to_tensor_no_scale),
+                T.ToPILImage(),  # Convert numpy array to PIL Image
+                T.Grayscale(),  # Convert to grayscale
+                T.Resize(
+                    (input_shape[1], input_shape[2]),
+                    interpolation=T.InterpolationMode.BILINEAR,
+                ),  # Resize (H, W)
+                T.ToTensor(),  # Convert PIL Image to PyTorch Tensor (scales to [0, 1])
             ]
         )
-        self.last_action = 0
-        self.frames = deque(maxlen=STACK_FRAMES)
-        self.skip_count = SKIP_FRAMES - 1
 
-    def _load_model(self, filepath):
-        """Loads policy network weights from a checkpoint file."""
-        if not os.path.isfile(filepath):
-            print(f"Error: Checkpoint file not found at {filepath}")
-            return False
+        # Frame stack (stores the last 4 processed frames)
+        self._frame_stack: Deque[np.ndarray] = deque(maxlen=input_shape[0])
+        self._state_initialized: bool = False  # Flag to check if frame stack is ready
+        self._skip_counter: int = 0
+        self._last_action: int = 0  # Default to a safe action (e.g., NOOP)
 
-        print(f"Loading model checkpoint from {filepath}...")
-        try:
-            # Load the state dict, mapping to the correct device
-            checkpoint = torch.load(filepath, map_location=self.device)
-
-            # Determine the state dict to load
-            state_dict_to_load = None
-            if isinstance(checkpoint, dict) and "policy_net_state_dict" in checkpoint:
-                state_dict_to_load = checkpoint["policy_net_state_dict"]
-                print("Found 'policy_net_state_dict' in checkpoint.")
-            elif isinstance(checkpoint, dict):
-                # Check if the checkpoint itself is the state_dict (might happen with older saves)
-                # A simple heuristic: check if keys look like model parameters
-                if all(
-                    isinstance(k, str) and isinstance(v, torch.Tensor)
-                    for k, v in checkpoint.items()
-                ):
-                    state_dict_to_load = checkpoint
-                    print("Checkpoint appears to be a state_dict directly.")
-                else:
-                    print(
-                        "Warning: Checkpoint is a dictionary but doesn't contain 'policy_net_state_dict' key "
-                        "and doesn't look like a raw state_dict. Attempting to load keys matching the model."
-                    )
-                    # Fallback: try loading matching keys if it's some other dict format
-                    state_dict_to_load = checkpoint
-
-            else:
-                # Assume the loaded object *is* the state_dict
-                state_dict_to_load = checkpoint
-                print("Checkpoint loaded directly as state_dict.")
-
-            if state_dict_to_load is None:
-                print(
-                    "Error: Could not determine the state dictionary to load from the checkpoint."
-                )
-                return False
-
-            # --- Load the state dict ---
-            # Use strict=False to ignore missing keys like "support".
-            # The "support" buffer is initialized in RainbowDQN.__init__ and doesn't
-            # strictly need to be loaded from the checkpoint.
-            # Other missing/unexpected keys will also be ignored.
-            incompatible_keys = self.policy_net.load_state_dict(
-                state_dict_to_load, strict=False
-            )
-
-            # Print warnings about mismatches (useful for debugging)
-            if incompatible_keys.missing_keys:
-                print(
-                    f"Warning: Missing keys when loading state_dict: {incompatible_keys.missing_keys}"
-                )
-                # Specifically check if 'support' was missing, which is expected
-                if "support" in incompatible_keys.missing_keys:
-                    print("('support' key was missing, which is expected and handled.)")
-            if incompatible_keys.unexpected_keys:
-                print(
-                    f"Warning: Unexpected keys when loading state_dict: {incompatible_keys.unexpected_keys}"
-                )
-
-            print("Model weights loaded successfully (strict=False).")
-            return True
-
-        except Exception as e:
-            print(f"Error loading checkpoint from {filepath}: {e}")
-            return False
-
-    def act(self, observation: np.ndarray):
+    def _preprocess_observation(self, observation: np.ndarray) -> torch.Tensor:
         """
-        Selects an action based on the given observation.
+        Preprocesses a single observation frame.
 
         Args:
-            observation (np.ndarray or LazyFrames): The current environment state observation.
-                                                    Expected shape should match `state_shape`
-                                                    provided during initialization.
+            observation: The raw observation from the environment (H, W, C).
 
         Returns:
-            int: The chosen action index.
+            A processed frame as a PyTorch tensor (1, H, W).
         """
+        # Ensure contiguous array if needed (often helps with PyTorch transforms)
+        if not observation.flags["C_CONTIGUOUS"]:
+            observation = np.ascontiguousarray(observation)
+        # Apply the transformations
+        processed_frame = self.transform(observation)  # Output shape: (1, H, W)
+        return processed_frame
 
-        # Convert state to tensor, add batch dimension, move to device
-        # Ensure the observation is float32, as expected by Conv2d layers
-        # Normalization (dividing by 255) happens inside the RainbowDQN forward pass
-        img = self.transform(observation).squeeze(0)
+    def _initialize_state(self, initial_observation: np.ndarray):
+        """Initializes the frame stack with the first observation."""
+        processed_frame = self._preprocess_observation(initial_observation)
+        # Fill the deque with the first frame
+        for _ in range(self._frame_stack.maxlen):
+            self._frame_stack.append(processed_frame)
+        self._state_initialized = True
+        print("Frame stack initialized.")
 
-        # Frame stacking
-        while len(self.frames) < STACK_FRAMES:
-            self.frames.append(img)
-        self.frames.append(img)
+    def act(self, observation: np.ndarray) -> int:
+        """
+        Selects an action based on the current observation.
 
-        # Skip Frames to ensure FPS is consistent with training
-        if self.skip_count > 0:
-            self.skip_count -= 1
-            return self.last_action
+        Args:
+            observation: The current observation from the environment.
 
-        # --- Action Selection ---
-        # Disable gradient calculations for inference
-        state = np.stack(self.frames, axis=0)  # Shape: [STACK_FRAMES, 84, 84]
-        state = (
-            torch.tensor(state).unsqueeze(0).to(self.device)
-        )  # Shape: [1, STACK_FRAMES, 84, 84]
-        with torch.no_grad():
-            # Get action distributions from the network
-            # The network's forward pass handles normalization and feature extraction
-            dist = self.policy_net(state)  # Shape: [1, n_actions, n_atoms]
+        Returns:
+            The selected action index.
+        """
+        # 1. Initialize frame stack on the very first call
+        if not self._state_initialized:
+            self._initialize_state(observation)
+            # Need to compute the first action immediately after initialization
+            # Fall through to action computation
 
-            # Calculate expected Q-values: sum(probability * support_value)
-            # The support vector is registered as a buffer in RainbowDQN and moved to device
-            # Ensure support is available and on the correct device
-            support = self.policy_net.support.view(1, 1, self.num_atoms)
-            expected_value = (dist * support).sum(
-                dim=2
-            )  # Sum over the atoms dimension. Shape: [1, n_actions]
+        # 2. Handle frame skipping
+        if self._skip_counter > 0:
+            self._skip_counter -= 1
+            # Repeat the last action
+            return self._last_action
 
-            # Choose action with the highest expected Q-value
-            action = expected_value.argmax(dim=1).item()  # Get the index (action)
-        # print(action)
-        self.last_action = action
-        self.skip_count = SKIP_FRAMES - 1
+        # 3. Preprocess the new frame and update the stack
+        processed_frame = self._preprocess_observation(observation)
+        self._frame_stack.append(processed_frame)
+
+        # 4. Stack frames and prepare model input
+        # Concatenate tensors along the channel dimension (dim=0)
+        # The deque stores tensors of shape (1, H, W), stacking makes (C, H, W)
+        state_tensor = (
+            torch.cat(list(self._frame_stack), dim=0).unsqueeze(0).to(self.device)
+        )
+        # Final shape: (1, C, H, W) - batch dim added
+
+        # 5. Get action from the model
+        with torch.no_grad():  # Disable gradient calculation for inference
+            q_values = self.model(state_tensor)
+            action = q_values.argmax(dim=1).item()  # Get index of max Q-value
+
+        # 6. Update state for next steps
+        self._last_action = action
+        self._skip_counter = self._frames_to_skip  # Reset skip counter
+
+        # Optional: Clean up tensor to free memory if needed, though Python's GC usually handles it.
+        # del state_tensor, q_values
+
         return action
+
+    def reset(self):
+        """Resets the agent's internal state for a new episode."""
+        self._frame_stack.clear()
+        self._state_initialized = False
+        self._skip_counter = 0
+        self._last_action = 0  # Reset to default action
+        print("Agent state reset for new episode.")
+
+
+# Example Usage (requires gym environment)
+if __name__ == "__main__":
+    # --- Setup Environment (Example: Using a dummy environment) ---
+    class DummyEnv:
+        def __init__(self):
+            # Example observation space (adjust to match Mario)
+            self.observation_space = gym.spaces.Box(
+                low=0, high=255, shape=(240, 256, 3), dtype=np.uint8
+            )
+            # Example action space (matches COMPLEX_MOVEMENT length)
+            self.action_space = gym.spaces.Discrete(len(COMPLEX_MOVEMENT))
+
+        def reset(self):
+            print("DummyEnv: Resetting environment.")
+            # Return a dummy observation (e.g., black screen)
+            return np.zeros(self.observation_space.shape, dtype=np.uint8)
+
+        def step(self, action):
+            print(f"DummyEnv: Taking action {action}")
+            # Return dummy next_state, reward, done, info
+            next_obs = np.random.randint(
+                0, 256, self.observation_space.shape, dtype=np.uint8
+            )
+            reward = np.random.rand()
+            done = np.random.rand() > 0.95  # Randomly end episode
+            info = {}
+            return next_obs, reward, done, info
+
+    # --- Initialize Agent and Run ---
+    try:
+        # Create a dummy checkpoint file if it doesn't exist for testing
+        # In a real scenario, this file should contain trained weights
+        dummy_checkpoint_path = "rainbow_mario_model_final.pth"
+        if not torch.save(
+            MockRainbowDQN((4, 84, 90), len(COMPLEX_MOVEMENT)).state_dict(),
+            dummy_checkpoint_path,
+        ):
+            print(f"Created dummy checkpoint at {dummy_checkpoint_path}")
+
+        # Initialize agent (adjust parameters if needed)
+        agent = Agent(
+            checkpoint_path=dummy_checkpoint_path,
+            input_shape=(4, 84, 90),  # Should match model training
+            n_actions=len(COMPLEX_MOVEMENT),
+            skip_frames=4,
+        )
+
+        # Initialize dummy environment
+        env = DummyEnv()
+        obs = env.reset()
+
+        # Run for a few steps
+        total_reward = 0
+        for step in range(20):
+            action = agent.act(obs)
+            print(
+                f"Step {step + 1}: Agent selected action {action} ({COMPLEX_MOVEMENT[action]})"
+            )
+
+            next_obs, reward, done, info = env.step(action)
+            total_reward += reward
+            print(f"   Reward: {reward:.4f}, Done: {done}")
+
+            obs = next_obs
+
+            if done:
+                print("Episode finished.")
+                agent.reset()  # Reset agent state
+                obs = env.reset()  # Reset environment
+
+        print(f"\nTotal reward over {step + 1} steps: {total_reward:.4f}")
+
+    except ImportError as e:
+        print(
+            f"ImportError: {e}. Make sure 'train.py' with RainbowDQN/NoisyLinear/COMPLEX_MOVEMENT is accessible."
+        )
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
